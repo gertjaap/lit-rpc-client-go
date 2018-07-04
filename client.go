@@ -537,7 +537,7 @@ func (c *LitRpcClient) SetContractDivision(contractIndex uint64, valueFullyOurs,
 	args := new(litrpc.SetContractDivisionArgs)
 	args.CIdx = contractIndex
 	args.ValueFullyOurs = valueFullyOurs
-	args.ValueFullyOurs = valueFullyTheirs
+	args.ValueFullyTheirs = valueFullyTheirs
 	reply := new(litrpc.SetContractDivisionReply)
 	err := c.rpcConn.Call("LitRPC.SetContractDivision", args, reply)
 	if err != nil {
@@ -611,6 +611,24 @@ func (c *LitRpcClient) SetContractRPoint(contractIndex uint64, rPoint []byte) er
 	copy(args.RPoint[:], rPoint)
 	reply := new(litrpc.SetContractRPointReply)
 	err := c.rpcConn.Call("LitRPC.SetContractRPoint", args, reply)
+	if err != nil {
+		return err
+	}
+	if !reply.Success {
+		return fmt.Errorf("Server returned success = false")
+	}
+
+	return nil
+}
+
+// SetContractDatafeed sets a data feed by index to a contract, which is then
+// used to fetch the R-point from the oracle's REST API
+func (c *LitRpcClient) SetContractDatafeed(contractIndex uint64, feedIndex uint64) error {
+	args := new(litrpc.SetContractDatafeedArgs)
+	args.CIdx = contractIndex
+	args.Feed = feedIndex
+	reply := new(litrpc.SetContractDatafeedReply)
+	err := c.rpcConn.Call("LitRPC.SetContractDatafeed", args, reply)
 	if err != nil {
 		return err
 	}

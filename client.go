@@ -1,41 +1,56 @@
 package litrpcclient
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
-	"net/rpc"
-	"net/rpc/jsonrpc"
+	"log"
+	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/mit-dci/lit/btcutil/btcec"
 	"github.com/mit-dci/lit/dlc"
 	"github.com/mit-dci/lit/litrpc"
+	"github.com/mit-dci/lit/lndc"
 	"github.com/mit-dci/lit/lnutil"
 	"github.com/mit-dci/lit/qln"
-	"golang.org/x/net/websocket"
 )
 
 type LitRpcClient struct {
-	wsConn          *websocket.Conn
-	rpcConn         *rpc.Client
-	listeningStatus uint8
+	conn             *lndc.Conn
+	requestNonce     uint64
+	requestNonceMtx  sync.Mutex
+	responseChannels map[uint64]chan lnutil.RemoteControlRpcResponseMsg
+	key              *btcec.PrivateKey
+	listeningStatus  int
 }
 
 // NewClient creates a new LitRpcClient and connects to the given
 // hostname and port
-func NewClient(host string, port int32) (*LitRpcClient, error) {
-	client := new(LitRpcClient)
+func NewClient(privKeyBytes []byte, host string, port int32, lnAddr string) *LitRpcClient {
 	var err error
-	client.wsConn, err = websocket.Dial(fmt.Sprintf("ws://%s:%d/ws", host, port), "", "http://127.0.0.1/")
+	client := new(LitRpcClient)
+	privKey, _ := btcec.PrivKeyFromBytes(btcec.S256(), privKeyBytes)
+	client.key = privKey
+
+	client.responseChannels = make(map[uint64]chan lnutil.RemoteControlRpcResponseMsg)
+
+	addr := fmt.Sprintf("%s:%d", host, port)
+	client.conn, err = lndc.Dial(client.key, addr, lnAddr, net.Dial)
 	if err != nil {
-		return nil, err
+		log.Fatal(err)
 	}
-	client.rpcConn = jsonrpc.NewClient(client.wsConn)
-	return client, nil
+
+	go client.ReceiveLoop()
+	return client
 }
 
 // Close Disconnects from the LIT node
 func (c *LitRpcClient) Close() {
-	c.wsConn.Close()
+	c.conn.Close()
 }
 
 //Listen instructs LIT to listen for incoming connections. By default, LIT will not
@@ -46,7 +61,7 @@ func (c *LitRpcClient) Listen(port string) error {
 	args.Port = port
 
 	reply := new(litrpc.ListeningPortsReply)
-	err := c.rpcConn.Call("LitRPC.Listen", args, reply)
+	err := c.Call("LitRPC.Listen", args, reply)
 	if err != nil {
 		if strings.Index(err.Error(), "already in use") == -1 {
 			return err
@@ -64,7 +79,7 @@ func (c *LitRpcClient) IsListening() (bool, error) {
 
 	args := new(litrpc.NoArgs)
 	reply := new(litrpc.ListeningPortsReply)
-	err := c.rpcConn.Call("LitRPC.GetListeningPorts", args, reply)
+	err := c.Call("LitRPC.GetListeningPorts", args, reply)
 	if err != nil {
 		return false, err
 	}
@@ -75,12 +90,20 @@ func (c *LitRpcClient) IsListening() (bool, error) {
 	return (c.listeningStatus == 1), nil
 }
 
+func (c *LitRpcClient) RequestRemoteAccess() error {
+	args := new(litrpc.NoArgs)
+	reply := new(litrpc.StatusReply)
+
+	err := c.Call("LitRPC.RequestRemoteControlAuthorization", args, reply)
+	return err
+}
+
 // GetLNAddress returns the LN address for this node
 func (c *LitRpcClient) GetLNAddress() (string, error) {
 	args := new(litrpc.NoArgs)
 
 	reply := new(litrpc.ListeningPortsReply)
-	err := c.rpcConn.Call("LitRPC.GetListeningPorts", args, reply)
+	err := c.Call("LitRPC.GetListeningPorts", args, reply)
 	if err != nil {
 		return "", err
 	}
@@ -98,7 +121,7 @@ func (c *LitRpcClient) Connect(address, host string, port uint32) error {
 			args.LNAddr += ":" + strconv.Itoa(int(port))
 		}
 	}
-	err := c.rpcConn.Call("LitRPC.Connect", args, reply)
+	err := c.Call("LitRPC.Connect", args, reply)
 	if err != nil {
 		return err
 	}
@@ -114,7 +137,7 @@ func (c *LitRpcClient) ListConnections() ([]qln.PeerInfo, error) {
 	args := new(litrpc.NoArgs)
 
 	reply := new(litrpc.ListConnectionsReply)
-	err := c.rpcConn.Call("LitRPC.ListConnections", args, reply)
+	err := c.Call("LitRPC.ListConnections", args, reply)
 	if err != nil {
 		return empty, err
 	}
@@ -131,7 +154,7 @@ func (c *LitRpcClient) AssignNickname(peerIndex uint32, nickname string) error {
 	args.Peer = peerIndex
 	args.Nickname = nickname
 	reply := new(litrpc.StatusReply)
-	err := c.rpcConn.Call("LitRPC.AssignNickname", args, reply)
+	err := c.Call("LitRPC.AssignNickname", args, reply)
 	if err != nil {
 		return err
 	}
@@ -146,7 +169,7 @@ func (c *LitRpcClient) AssignNickname(peerIndex uint32, nickname string) error {
 func (c *LitRpcClient) Stop() error {
 	args := new(litrpc.NoArgs)
 	reply := new(litrpc.StatusReply)
-	err := c.rpcConn.Call("LitRPC.Stop", args, reply)
+	err := c.Call("LitRPC.Stop", args, reply)
 	if err != nil {
 		return err
 	}
@@ -162,7 +185,7 @@ func (c *LitRpcClient) ListBalances() ([]litrpc.CoinBalReply, error) {
 	args := new(litrpc.NoArgs)
 
 	reply := new(litrpc.BalanceReply)
-	err := c.rpcConn.Call("LitRPC.Balance", args, reply)
+	err := c.Call("LitRPC.Balance", args, reply)
 	if err != nil {
 		return empty, err
 	}
@@ -179,7 +202,7 @@ func (c *LitRpcClient) ListUtxos() ([]litrpc.TxoInfo, error) {
 	args := new(litrpc.NoArgs)
 
 	reply := new(litrpc.TxoListReply)
-	err := c.rpcConn.Call("LitRPC.TxoList", args, reply)
+	err := c.Call("LitRPC.TxoList", args, reply)
 	if err != nil {
 		return empty, err
 	}
@@ -197,7 +220,7 @@ func (c *LitRpcClient) Send(address string, amount int64) (string, error) {
 	args.Amts = []int64{amount}
 	args.DestAddrs = []string{address}
 	reply := new(litrpc.TxidsReply)
-	err := c.rpcConn.Call("LitRPC.Send", args, reply)
+	err := c.Call("LitRPC.Send", args, reply)
 	if err != nil {
 		return "", err
 	}
@@ -215,7 +238,7 @@ func (c *LitRpcClient) SetFee(coinType uint32, feePerByte int64) error {
 	args.CoinType = coinType
 	args.Fee = feePerByte
 	reply := new(litrpc.FeeReply)
-	err := c.rpcConn.Call("LitRPC.SetFee", args, reply)
+	err := c.Call("LitRPC.SetFee", args, reply)
 	if err != nil {
 		return err
 	}
@@ -231,7 +254,7 @@ func (c *LitRpcClient) GetFee(coinType uint32) (int64, error) {
 	args := new(litrpc.FeeArgs)
 	args.CoinType = coinType
 	reply := new(litrpc.FeeReply)
-	err := c.rpcConn.Call("LitRPC.GetFee", args, reply)
+	err := c.Call("LitRPC.GetFee", args, reply)
 	if err != nil {
 		return 0, err
 	}
@@ -247,7 +270,7 @@ func (c *LitRpcClient) GetAddresses(coinType, numberToMake uint32, legacy bool) 
 	args.CoinType = coinType
 	args.NumToMake = numberToMake
 	reply := new(litrpc.AddressReply)
-	err := c.rpcConn.Call("LitRPC.Address", args, reply)
+	err := c.Call("LitRPC.Address", args, reply)
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +291,7 @@ func (c *LitRpcClient) ListChannels() ([]litrpc.ChannelInfo, error) {
 	args := new(litrpc.NoArgs)
 
 	reply := new(litrpc.ChannelListReply)
-	err := c.rpcConn.Call("LitRPC.ChannelList", args, reply)
+	err := c.Call("LitRPC.ChannelList", args, reply)
 	if err != nil {
 		return empty, err
 	}
@@ -292,7 +315,7 @@ func (c *LitRpcClient) FundChannel(peerIndex, coinType uint32, amount, initialSe
 	args.InitialSend = initialSend
 	copy(args.Data[:], data)
 	reply := new(litrpc.StatusReply)
-	err := c.rpcConn.Call("LitRPC.FundChannel", args, reply)
+	err := c.Call("LitRPC.FundChannel", args, reply)
 	if err != nil {
 		return err
 	}
@@ -311,7 +334,7 @@ func (c *LitRpcClient) StateDump() ([]qln.JusticeTx, error) {
 	args := new(litrpc.NoArgs)
 
 	reply := new(litrpc.StateDumpReply)
-	err := c.rpcConn.Call("LitRPC.StateDump", args, reply)
+	err := c.Call("LitRPC.StateDump", args, reply)
 	if err != nil {
 		return empty, err
 	}
@@ -330,7 +353,7 @@ func (c *LitRpcClient) Push(channelIndex uint32, amount int64, data []byte) (uin
 	args.Amt = amount
 	copy(args.Data[:], data)
 	reply := new(litrpc.PushReply)
-	err := c.rpcConn.Call("LitRPC.Push", args, reply)
+	err := c.Call("LitRPC.Push", args, reply)
 	if err != nil {
 		return 0, err
 	}
@@ -342,7 +365,7 @@ func (c *LitRpcClient) CloseChannel(channelIndex uint32) error {
 	args := new(litrpc.ChanArgs)
 	args.ChanIdx = channelIndex
 	reply := new(litrpc.StatusReply)
-	err := c.rpcConn.Call("LitRPC.CloseChannel", args, reply)
+	err := c.Call("LitRPC.CloseChannel", args, reply)
 	if err != nil {
 		return err
 	}
@@ -360,7 +383,7 @@ func (c *LitRpcClient) BreakChannel(channelIndex uint32) error {
 	args := new(litrpc.ChanArgs)
 	args.ChanIdx = channelIndex
 	reply := new(litrpc.StatusReply)
-	err := c.rpcConn.Call("LitRPC.BreakChannel", args, reply)
+	err := c.Call("LitRPC.BreakChannel", args, reply)
 	if err != nil {
 		return err
 	}
@@ -377,7 +400,7 @@ func (c *LitRpcClient) ImportOracle(url, name string) (*dlc.DlcOracle, error) {
 	args.Url = url
 	args.Name = name
 	reply := new(litrpc.ImportOracleReply)
-	err := c.rpcConn.Call("LitRPC.ImportOracle", args, reply)
+	err := c.Call("LitRPC.ImportOracle", args, reply)
 	if err != nil {
 		return nil, err
 	}
@@ -390,7 +413,7 @@ func (c *LitRpcClient) AddOracle(pubKeyHex, name string) (*dlc.DlcOracle, error)
 	args.Key = pubKeyHex
 	args.Name = name
 	reply := new(litrpc.AddOracleReply)
-	err := c.rpcConn.Call("LitRPC.AddOracle", args, reply)
+	err := c.Call("LitRPC.AddOracle", args, reply)
 	if err != nil {
 		return nil, err
 	}
@@ -403,7 +426,7 @@ func (c *LitRpcClient) ListOracles() ([]*dlc.DlcOracle, error) {
 	args := new(litrpc.NoArgs)
 
 	reply := new(litrpc.ListOraclesReply)
-	err := c.rpcConn.Call("LitRPC.ListOracles", args, reply)
+	err := c.Call("LitRPC.ListOracles", args, reply)
 	if err != nil {
 		return empty, err
 	}
@@ -419,7 +442,7 @@ func (c *LitRpcClient) NewContract() (*lnutil.DlcContract, error) {
 	args := new(litrpc.NoArgs)
 
 	reply := new(litrpc.NewContractReply)
-	err := c.rpcConn.Call("LitRPC.NewContract", args, reply)
+	err := c.Call("LitRPC.NewContract", args, reply)
 	if err != nil {
 		return nil, err
 	}
@@ -435,7 +458,7 @@ func (c *LitRpcClient) GetContract(contractIndex uint64) (*lnutil.DlcContract, e
 	args := new(litrpc.GetContractArgs)
 	args.Idx = contractIndex
 	reply := new(litrpc.GetContractReply)
-	err := c.rpcConn.Call("LitRPC.GetContract", args, reply)
+	err := c.Call("LitRPC.GetContract", args, reply)
 	if err != nil {
 		return nil, err
 	}
@@ -451,7 +474,7 @@ func (c *LitRpcClient) ListContracts() ([]*lnutil.DlcContract, error) {
 	args := new(litrpc.NoArgs)
 
 	reply := new(litrpc.ListContractsReply)
-	err := c.rpcConn.Call("LitRPC.ListContracts", args, reply)
+	err := c.Call("LitRPC.ListContracts", args, reply)
 	if err != nil {
 		return []*lnutil.DlcContract{}, err
 	}
@@ -468,7 +491,7 @@ func (c *LitRpcClient) OfferContract(contractIndex uint64, peerIndex uint32) err
 	args.CIdx = contractIndex
 	args.PeerIdx = peerIndex
 	reply := new(litrpc.OfferContractReply)
-	err := c.rpcConn.Call("LitRPC.OfferContract", args, reply)
+	err := c.Call("LitRPC.OfferContract", args, reply)
 	if err != nil {
 		return err
 	}
@@ -485,7 +508,7 @@ func (c *LitRpcClient) ContractRespond(contractIndex uint64, acceptOrDecline boo
 	args.CIdx = contractIndex
 	args.AcceptOrDecline = acceptOrDecline
 	reply := new(litrpc.ContractRespondReply)
-	err := c.rpcConn.Call("LitRPC.ContractRespond", args, reply)
+	err := c.Call("LitRPC.ContractRespond", args, reply)
 	if err != nil {
 		return err
 	}
@@ -514,7 +537,7 @@ func (c *LitRpcClient) SettleContract(contractIndex uint64, oracleValue int64, o
 	copy(args.OracleSig[:], oracleSignature)
 	args.OracleValue = oracleValue
 	reply := new(litrpc.SettleContractReply)
-	err := c.rpcConn.Call("LitRPC.SettleContract", args, reply)
+	err := c.Call("LitRPC.SettleContract", args, reply)
 	if err != nil {
 		return err
 	}
@@ -534,7 +557,7 @@ func (c *LitRpcClient) SetContractDivision(contractIndex uint64, valueFullyOurs,
 	args.ValueFullyOurs = valueFullyOurs
 	args.ValueFullyTheirs = valueFullyTheirs
 	reply := new(litrpc.SetContractDivisionReply)
-	err := c.rpcConn.Call("LitRPC.SetContractDivision", args, reply)
+	err := c.Call("LitRPC.SetContractDivision", args, reply)
 	if err != nil {
 		return err
 	}
@@ -551,7 +574,7 @@ func (c *LitRpcClient) SetContractCoinType(contractIndex uint64, coinType uint32
 	args.CIdx = contractIndex
 	args.CoinType = coinType
 	reply := new(litrpc.SetContractCoinTypeReply)
-	err := c.rpcConn.Call("LitRPC.SetContractCoinType", args, reply)
+	err := c.Call("LitRPC.SetContractCoinType", args, reply)
 	if err != nil {
 		return err
 	}
@@ -570,7 +593,7 @@ func (c *LitRpcClient) SetContractFunding(contractIndex uint64, ourAmount, their
 	args.OurAmount = ourAmount
 	args.TheirAmount = theirAmount
 	reply := new(litrpc.SetContractFundingReply)
-	err := c.rpcConn.Call("LitRPC.SetContractFunding", args, reply)
+	err := c.Call("LitRPC.SetContractFunding", args, reply)
 	if err != nil {
 		return err
 	}
@@ -587,7 +610,7 @@ func (c *LitRpcClient) SetContractSettlementTime(contractIndex uint64, settlemen
 	args.CIdx = contractIndex
 	args.Time = settlementTime
 	reply := new(litrpc.SetContractSettlementTimeReply)
-	err := c.rpcConn.Call("LitRPC.SetContractSettlementTime", args, reply)
+	err := c.Call("LitRPC.SetContractSettlementTime", args, reply)
 	if err != nil {
 		return err
 	}
@@ -605,7 +628,7 @@ func (c *LitRpcClient) SetContractRPoint(contractIndex uint64, rPoint []byte) er
 	args.CIdx = contractIndex
 	copy(args.RPoint[:], rPoint)
 	reply := new(litrpc.SetContractRPointReply)
-	err := c.rpcConn.Call("LitRPC.SetContractRPoint", args, reply)
+	err := c.Call("LitRPC.SetContractRPoint", args, reply)
 	if err != nil {
 		return err
 	}
@@ -623,7 +646,7 @@ func (c *LitRpcClient) SetContractDatafeed(contractIndex uint64, feedIndex uint6
 	args.CIdx = contractIndex
 	args.Feed = feedIndex
 	reply := new(litrpc.SetContractDatafeedReply)
-	err := c.rpcConn.Call("LitRPC.SetContractDatafeed", args, reply)
+	err := c.Call("LitRPC.SetContractDatafeed", args, reply)
 	if err != nil {
 		return err
 	}
@@ -640,7 +663,7 @@ func (c *LitRpcClient) SetContractOracle(contractIndex, oracleIndex uint64) erro
 	args.CIdx = contractIndex
 	args.OIdx = oracleIndex
 	reply := new(litrpc.SetContractOracleReply)
-	err := c.rpcConn.Call("LitRPC.SetContractOracle", args, reply)
+	err := c.Call("LitRPC.SetContractOracle", args, reply)
 	if err != nil {
 		return err
 	}
@@ -649,4 +672,79 @@ func (c *LitRpcClient) SetContractOracle(contractIndex, oracleIndex uint64) erro
 	}
 
 	return nil
+}
+
+func (c *LitRpcClient) Call(serviceMethod string, args interface{}, reply interface{}) error {
+	var err error
+	c.requestNonceMtx.Lock()
+	c.requestNonce++
+	nonce := c.requestNonce
+	c.requestNonceMtx.Unlock()
+
+	c.responseChannels[nonce] = make(chan lnutil.RemoteControlRpcResponseMsg)
+	go func() {
+		msg := new(lnutil.RemoteControlRpcRequestMsg)
+		msg.Args, err = json.Marshal(args)
+		msg.Idx = nonce
+		msg.Method = serviceMethod
+
+		if err != nil {
+			panic(err)
+		}
+
+		rawMsg := msg.Bytes()
+		n, err := c.conn.Write(rawMsg)
+		if err != nil {
+			panic(err)
+		}
+
+		if n < len(rawMsg) {
+			panic(fmt.Errorf("Did not write entire message to peer"))
+		}
+	}()
+	select {
+	case receivedReply := <-c.responseChannels[nonce]:
+		{
+			if receivedReply.Error {
+				return errors.New(string(receivedReply.Result))
+			}
+
+			err = json.Unmarshal(receivedReply.Result, &reply)
+			return err
+		}
+	case <-time.After(time.Second * 10):
+		return errors.New("RPC call timed out")
+	}
+	return nil
+}
+
+func (c *LitRpcClient) ReceiveLoop() {
+	for {
+		msg := make([]byte, 1<<24)
+		//	log.Printf("read message from %x\n", l.RemoteLNId)
+		n, err := c.conn.Read(msg)
+		if err != nil {
+			c.conn.Close()
+			panic(err)
+		}
+		msg = msg[:n]
+		// We only care about RPC responses
+		if msg[0] == lnutil.MSGID_REMOTE_RPCRESPONSE {
+			response, err := lnutil.NewRemoteControlRpcResponseMsgFromBytes(msg, 0)
+			if err != nil {
+				panic(err)
+			}
+
+			responseChan, ok := c.responseChannels[response.Idx]
+			if ok {
+				select {
+				case responseChan <- response:
+				default:
+				}
+				delete(c.responseChannels, response.Idx)
+			}
+
+		}
+	}
+
 }
